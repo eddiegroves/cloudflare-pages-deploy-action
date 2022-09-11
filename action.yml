@@ -1,0 +1,299 @@
+name: "Cloudflare Pages deploy"
+description: "Deploys files to Cloudflare Pages project and sets Github deployment status."
+inputs:
+  cloudflare-account-id:
+    description: Cloudflare account ID that contains the Pages project
+    required: true
+  cloudflare-api-token:
+    description: Cloudflare API token with Cloudflare Pages read/write permission.
+    required: true
+  cloudflare-environment:
+    description: The name of the environment (Cloudflare calls it a branch) you want for the Cloudflare Pages deployment. Does not have to match git branch.
+    required: true
+  cloudflare-pages-project-name:
+    description: The name of the Cloudflare Pages project you want to deploy to.
+    required: true
+  cloudflare-publish-directory:
+    description: The directory of static files to upload to Cloudflare Pages.
+    required: true
+outputs:
+  github-deployment-id:
+    description: "The GitHub deployment identifier that this action created."
+    value: ${{ steps.create-gh-deployment.outputs.github-deployment-id }}
+  cloudflare-pages-deployment-id :
+    description: "The created Cloudflare Pages deployment identifier."
+    value: ${{ steps.poll-deployment-status.outputs.cloudflare-pages-deployment-id }}
+  cloudflare-pages-url:
+    description: "The URL where Cloudflare Pages was deployed to."
+    value: ${{ steps.poll-deployment-status.outputs.cloudflare-pages-url }}
+runs:
+  using: "composite"
+  steps:
+    - name: Create GitHub deployment
+      id: create-gh-deployment
+      shell: bash
+      env:
+        INPUT_GITHUB_REPOSITORY: ${{ github.repository }}
+        INPUT_ENVIRONMENT: ${{ inputs.cloudflare-environment }}
+        INPUT_GITHUB_REF: ${{ github.ref }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        # * Inputs
+        #
+        # |-------------------------+----------------------------------------------------------------------|
+        # | Environment variable    | Description                                                          |
+        # |-------------------------+----------------------------------------------------------------------|
+        # | INPUT_ENVIRONMENT       | The deployment target environment, e.g test, dev, qa, staging.       |
+        # | INPUT_GITHUB_REF        | The ref for the deploy. This can be a branch, tag, or SHA.           |
+        # | INPUT_GITHUB_REPOSITORY | The owner and repository name. For example, eddiegroves/hello-world. |
+        # | GITHUB_TOKEN            | A token to authenticate on behalf of the GitHub Action.              |
+        # |-------------------------+----------------------------------------------------------------------|
+        #
+        # * Outputs
+        #
+        # |----------------------+------------------------------------------|
+        # | GitHub outputs       | Description                              |
+        # |----------------------+------------------------------------------|
+        # | github-deployment-id | The created GitHub deployment identifier |
+        # |----------------------+------------------------------------------|
+        
+        errors=""
+        declare -a inputs=("INPUT_ENVIRONMENT" "INPUT_GITHUB_REF" "INPUT_GITHUB_REPOSITORY" "GITHUB_TOKEN")
+        
+        for input_name in "${inputs[@]}"
+        do
+            if [ -z ${!input_name+x} ]; then
+               errors="${errors}environment variable $input_name is required\n"
+            fi
+        done
+        
+        if [ ! -z "${errors}" ]; then
+            printf "$errors"
+            exit 1
+        fi
+        
+        json_string=$( jq -n \
+                         --arg environment "$INPUT_ENVIRONMENT" \
+                         --arg github_ref "$INPUT_GITHUB_REF" \
+                         '{ auto_merge: false, description: "Cloudflare Pages", environment: $environment, production_environment: (if $environment == "production" then true else false end), ref: $github_ref, required_contexts: []}')
+        
+        curl --silent \
+          -X POST \
+          https://api.github.com/repos/$INPUT_GITHUB_REPOSITORY/deployments \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -d "$json_string" | jq '.id' | xargs -I {} echo "::set-output name=github-deployment-id::{}"
+    - name: Create Cloudflare Pages deployment
+      id: create-cf-deployment-status
+      shell: bash
+      env:
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare-account-id }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare-api-token }}
+        INPUT_PUBLISH_DIRECTORY: ${{ inputs.cloudflare-publish-directory }}
+        INPUT_CLOUDFLARE_PROJECT_NAME: ${{ inputs.cloudflare-pages-project-name }}
+        INPUT_ENVIRONMENT: ${{ inputs.cloudflare-environment }}
+        INPUT_COMMIT_HASH: ${{ github.sha }}
+        INPUT_MESSAGE: ${{ github.event.head_commit.message }}
+      run: |
+        # * Input
+        #
+        # |-------------------------------+-----------------------------------------------------------------|
+        # | Environment variable          | Description                                                     |
+        # |-------------------------------+-----------------------------------------------------------------|
+        # | CLOUDFLARE_ACCOUNT_ID         | Used by Wranlger to identify the Cloudflare Pages account.      |
+        # | CLOUDFLARE_API_TOKEN          | Used by Wranlger to authenticate to Cloudflare API.             |
+        # | INPUT_CLOUDFLARE_PROJECT_NAME | The name of the Cloudflare Pages project you want to deploy to. |
+        # | INPUT_ENVIRONMENT             | The deployment target environment, e.g test, dev, qa, staging.  |
+        # | INPUT_PUBLISH_DIRECTORY       | The directory of static files to upload.                        |
+        # | INPUT_COMMIT_HASH             | The SHA to attach to this deployment.                           |
+        # | INPUT_MESSAGE                 | The commit message to attach to this deployment.                |
+        # |-------------------------------+-----------------------------------------------------------------|
+        #
+        # * Output
+        #
+        # No outputs are created.
+        
+        errors=""
+        declare -a inputs=("CLOUDFLARE_ACCOUNT_ID" "CLOUDFLARE_API_TOKEN" "INPUT_CLOUDFLARE_PROJECT_NAME" "INPUT_ENVIRONMENT" "INPUT_PUBLISH_DIRECTORY" "INPUT_COMMIT_HASH" "INPUT_MESSAGE")
+        
+        for input_name in "${inputs[@]}"
+        do
+            if [ -z ${!input_name+x} ]; then
+               errors="${errors}environment variable $input_name is required\n"
+            fi
+        done
+        
+        if [ ! -z "${errors}" ]; then
+            printf "$errors"
+            exit 1
+        fi
+        
+        npx wrangler@2.0.29 pages publish $INPUT_PUBLISH_DIRECTORY \
+        --project-name=$INPUT_CLOUDFLARE_PROJECT_NAME \
+        --branch=$INPUT_ENVIRONMENT \
+        --commit-hash=$INPUT_COMMIT_HASH \
+        --commit-message="$INPUT_MESSAGE"
+    - name: Poll deployment status
+      id: poll-deployment-status
+      shell: python
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare-account-id }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare-api-token }}
+        INPUT_COMMIT_HASH: ${{ github.sha }}
+        INPUT_GITHUB_DEPLOYMENT_ID: ${{ steps.create-gh-deployment.outputs.github-deployment-id }}
+        INPUT_GITHUB_REPOSITORY: ${{ github.repository }}
+        INPUT_CLOUDFLARE_PROJECT_NAME: ${{ inputs.cloudflare-pages-project-name }}
+      run: |
+        # * Inputs
+        #
+        # |-------------------------------+----------+----------------------------------------------------------------------|
+        # | Environment variable          | Required | Description                                                          |
+        # |-------------------------------+----------+----------------------------------------------------------------------|
+        # | INPUT_COMMIT_HASH             | Yes      | The SHA to attach to this deployment.                                |
+        # | INPUT_GITHUB_DEPLOYMENT_ID    | Yes      | The GitHub deployment identifier for this deployment.                |
+        # | INPUT_GITHUB_REPOSITORY       | Yes      | The owner and repository name. For example, eddiegroves/hello-world. |
+        # | INPUT_CLOUDFLARE_PROJECT_NAME | Yes      | The name of the Cloudflare Pages project you want to deploy to.      |
+        # | GITHUB_TOKEN                  | Yes      | A token to authenticate on behalf of the GitHub Action.              |
+        # | CLOUDFLARE_ACCOUNT_ID         | Yes      | Used by Wrangler to identify the Cloudflare Pages account.           |
+        # | CLOUDFLARE_API_TOKEN          | Yes      | Used by Wrangler to authenticate to Cloudflare API.                  |
+        # |-------------------------------+----------+----------------------------------------------------------------------|
+        #
+        # * Outputs
+        # |--------------------------------+-----------------------------------------------------|
+        # | GitHub outputs                 | Description                                         |
+        # |--------------------------------+-----------------------------------------------------|
+        # | cloudflare-pages-deployment-id | The created Cloudflare Pages deployment identifier. |
+        # | cloudflare-pages-url           | The URL where Cloudflare Pages was deployed to.     |
+        # |--------------------------------+-----------------------------------------------------|
+        
+        import http.client
+        import json
+        import subprocess
+        import os
+        from time import sleep
+        from typing import Literal
+        
+        commit_hash = os.environ["INPUT_COMMIT_HASH"]
+        github_deployment_id = os.environ["INPUT_GITHUB_DEPLOYMENT_ID"]
+        github_repository = os.environ["INPUT_GITHUB_REPOSITORY"]
+        cloudflare_project_name = os.environ["INPUT_CLOUDFLARE_PROJECT_NAME"]
+        github_token = os.environ["GITHUB_TOKEN"]
+        cloudflare_api_token = os.environ["CLOUDFLARE_API_TOKEN"]
+        cloudflare_account_id = os.environ["CLOUDFLARE_ACCOUNT_ID"]
+        
+        
+        def create_github_deployment_status(
+            description: str,
+            environment: str,
+            state: Literal[
+                "error", "failure", "inactive", "in_progress", "queued", "pending", "success"
+            ],
+            log_url: str = None,
+            environment_url: str = None,
+        ):
+            payload = {"description": description, "environment": environment, "state": state}
+        
+            if log_url:
+                payload["log_url"] = log_url
+        
+            if environment_url:
+                payload["environment_url"] = environment_url
+        
+            headers = {
+                "User-Agent": "eddiegroves/action/cloudflare-deploy",
+                "Content-Type": "application/json",
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {github_token}",
+            }
+        
+            githubApi = http.client.HTTPSConnection("api.github.com")
+            githubApi.request(
+                "POST",
+                f"/repos/{github_repository}/deployments/{github_deployment_id}/statuses",
+                json.dumps(payload),
+                headers,
+            )
+        
+        
+        def list_cloudflare_deployments():
+            headers = {
+                "User-Agent": "eddiegroves/action/cloudflare-deploy",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {cloudflare_api_token}",
+            }
+        
+            cloudflareApi = http.client.HTTPSConnection("api.cloudflare.com")
+            cloudflareApi.request(
+                "GET",
+                f"/client/v4/accounts/{cloudflare_account_id}/pages/projects/{cloudflare_project_name}/deployments",
+                "",
+                headers,
+            )
+        
+            res = cloudflareApi.getresponse()
+            data = res.read().decode("utf-8")
+        
+            p = subprocess.run(
+                [
+                    "jq",
+                    "-r",
+                    "--arg",
+                    "commit",
+                    commit_hash,
+                    ".result[] | select(.deployment_trigger.metadata.commit_hash == $commit) | { id, project_name, environment,  url: (.aliases[0] // .url), stage: .latest_stage.name, status: .latest_stage.status }",
+                ],
+                input=data,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        
+            return json.loads(p.stdout)
+        
+        
+        count = 0
+        while count < 60:
+            deployment = list_cloudflare_deployments()
+        
+            if deployment["status"] == "failed":
+                print("😢 sad face")
+                create_github_deployment_status(
+                    description="Cloudflare Pages deployment failed.",
+                    environment="production",
+                    state="failure",
+                    log_url=f"https://dash.cloudflare.com?to=/:account/pages/view/{cloudflare_project_name}/{deployment['id']}",
+                )
+                exit(1)
+        
+            if deployment["stage"] == "deploy" and deployment["status"] == "success":
+                print("🤗 happy face")
+                create_github_deployment_status(
+                    description="Cloudflare Pages deployment success.",
+                    environment="production",
+                    state="success",
+                    log_url=f"https://dash.cloudflare.com?to=/:account/pages/view/{cloudflare_project_name}/{deployment['id']}",
+                    environment_url=deployment["url"],
+                )
+        
+                print(f"::set-output name=cloudflare-pages-deployment-id::{deployment['id']}")
+                print(f"::set-output name=cloudflare-pages-deployment-id::{deployment['url']}")
+                exit(0)
+        
+            print(f"🧐 {deployment['stage']} {deployment['status']}")
+            create_github_deployment_status(
+                description="Cloudflare Pages deployment in progress.",
+                environment="production",
+                state="in_progress",
+                log_url=f"https://dash.cloudflare.com?to=/:account/pages/view/{cloudflare_project_name}/{deployment['id']}",
+            )
+            sleep(5)
+            count = count + 1
+        
+        print("😭 super sad")
+        create_github_deployment_status(
+            description="Cloudflare Pages deployment status unknown.",
+            environment="production",
+            state="error",
+        )
+        exit(1)

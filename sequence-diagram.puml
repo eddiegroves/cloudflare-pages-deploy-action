@@ -1,0 +1,48 @@
+@startuml
+participant Action as "GitHub\nActions"
+participant step1 as "create-github-\ndeployment"
+participant step2 as "create-cloudflare-\npages-deployment"
+participant step3 as "poll-deployment-\nstatus"
+participant GitHub as "GitHub\nAPI"
+participant Cloudflare as "Cloudflare\nAPI"
+
+' Step 1 Create GitHub deployment
+Action -> step1 : Start step
+step1 -> GitHub : Create GitHub deployment
+return
+step1 --> Action : Deployment ID
+
+' Step 2 Create Cloudflare Pages deployment
+Action -> step2 : Start step
+step2 -> Cloudflare : Create Pages deployment
+return
+step2 --> Action
+
+' Step 3 Poll deployment status
+Action -> step3 : Start step
+
+loop up to 5 minutes
+
+    step3 -> Cloudflare : Find matching deployment
+    return id, stage, status
+
+    alt status == failure
+        step3 -> GitHub : Create GitHub deployment status (failed)
+        return
+        step3 --> Action
+    end
+
+    alt stage == deploy and status == success
+        step3 -> GitHub : Create GitHub deployment status (success)
+        return
+        step3 --> Action : id, Cloudflare Pages url
+    end
+
+    step3 -> GitHub : Create GitHub deployment status (pending)
+    return
+end
+
+step3 -> GitHub : Create GitHub deployment status (error)
+step3 --> Action
+
+@enduml

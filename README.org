@@ -1,0 +1,692 @@
+#+EXPORT_EXCLUDE_TAGS: noexport
+
+* Cloudflare Pages deploy action
+
+Deploys files to a Cloudflare Pages project using direct upload and sets GitHub
+deployment status.
+
+Advantages of direct upload compared with linking GitHub to Cloudflare:
+
+- No need to link Cloudflare Pages as a GitHub App to your entire GitHub account.
+- Full control over build process. Using CI/CD such as GitHub Actions is much
+  more flexible than Cloudflare for doing the build and adding other jobs.
+
+** Inputs
+
+#+name: action-inputs
+| Action input                  | Required | Description                                                                                                                                 |
+|-------------------------------+----------+---------------------------------------------------------------------------------------------------------------------------------------------|
+| cloudflare-account-id         | Yes      | Cloudflare account ID that contains the Pages project                                                                                       |
+| cloudflare-api-token          | Yes      | Cloudflare API token with Cloudflare Pages read/write permission.                                                                           |
+| cloudflare-environment        | Yes      | The name of the environment (Cloudflare calls it a branch) you want for the Cloudflare Pages deployment. Does not have to match git branch. |
+| cloudflare-pages-project-name | Yes      | The name of the Cloudflare Pages project you want to deploy to.                                                                             |
+| cloudflare-publish-directory  | Yes      | The directory of static files to upload to Cloudflare Pages.                                                                                |
+
+#+name: action-inputs-to-yaml
+#+begin_src python :var inputs=action-inputs :results raw :wrap src yaml :exports none
+import json
+import subprocess
+
+inputs_json = json.dumps(inputs)
+
+p = subprocess.run(
+    [
+        "gojq",
+        "--yaml-output",
+        '[ .[] | { (.[0]): { required: (.[1] == "Yes"), description: .[2] } } ] | add',
+    ],
+    input=inputs_json,
+    capture_output=True,
+    text=True,
+    check=True,
+)
+
+return p.stdout.rstrip()
+#+end_src
+
+** Outputs
+
+| Action outputs                 | Description                                         |
+|--------------------------------+-----------------------------------------------------|
+| github-deployment-id           | The created GitHub deployment identifier            |
+| cloudflare-pages-deployment-id | The created Cloudflare Pages deployment identifier. |
+| cloudflare-pages-url           | The URL where Cloudflare Pages was deployed to.     |
+
+** Example usage
+
+#+begin_src yaml
+name: Deploy to Cloudflare Pages production
+on:
+  push:
+    branches:
+      - main
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Build
+        run: make build
+      - id: Deploy
+        uses: eddiegroves/cloudflare-pages-deploy-action@7eb85e27aa014332055f718f151a7071ce50eae4
+        with:
+          cloudflare-publish-directory: dist/
+          cloudflare-environment: production
+          cloudflare-pages-project-name: eddie-cf-pages-example
+          cloudflare-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+#+end_src
+
+** Steps
+
+The action is developed as a [[https://docs.github.com/en/actions/creating-actions/creating-a-composite-action][composite action]] using bash or python steps. All
+steps are placed inline into the =run= sections to avoid issues with PATHs and
+external files.
+
+The process is three steps:
+1. Create GitHub deployment
+2. Create Cloudflare Pages deployment
+3. Poll deployment status
+
+*** Sequence diagram
+
+#+begin_src plantuml :exports none :tangle sequence-diagram.puml
+@startuml
+participant Action as "GitHub\nActions"
+participant step1 as "create-github-\ndeployment"
+participant step2 as "create-cloudflare-\npages-deployment"
+participant step3 as "poll-deployment-\nstatus"
+participant GitHub as "GitHub\nAPI"
+participant Cloudflare as "Cloudflare\nAPI"
+
+' Step 1 Create GitHub deployment
+Action -> step1 : Start step
+step1 -> GitHub : Create GitHub deployment
+return
+step1 --> Action : Deployment ID
+
+' Step 2 Create Cloudflare Pages deployment
+Action -> step2 : Start step
+step2 -> Cloudflare : Create Pages deployment
+return
+step2 --> Action
+
+' Step 3 Poll deployment status
+Action -> step3 : Start step
+
+loop up to 5 minutes
+
+    step3 -> Cloudflare : Find matching deployment
+    return id, stage, status
+
+    alt status == failure
+        step3 -> GitHub : Create GitHub deployment status (failed)
+        return
+        step3 --> Action
+    end
+
+    alt stage == deploy and status == success
+        step3 -> GitHub : Create GitHub deployment status (success)
+        return
+        step3 --> Action : id, Cloudflare Pages url
+    end
+
+    step3 -> GitHub : Create GitHub deployment status (pending)
+    return
+end
+
+step3 -> GitHub : Create GitHub deployment status (error)
+step3 --> Action
+
+@enduml
+#+end_src
+
+#+begin_src
+                              ┌───────┐          ┌──────────────┐          ┌──────────────────┐          ┌────────────────┐                              ┌──────┐          ┌──────────┐
+                              │GitHub │          │create-github-│          │create-cloudflare-│          │poll-deployment-│                              │GitHub│          │Cloudflare│
+                              │Actions│          │deployment    │          │pages-deployment  │          │status          │                              │API   │          │API       │
+                              └───┬───┘          └──────┬───────┘          └────────┬─────────┘          └───────┬────────┘                              └──┬───┘          └────┬─────┘
+                                  │     Start step      │                           │                            │                                          │                   │
+                                  │────────────────────>│                           │                            │                                          │                   │
+                                  │                     │                           │                            │                                          │                   │
+                                  │                     │                           │          Create GitHub deployment                                     │                   │
+                                  │                     │ ──────────────────────────────────────────────────────────────────────────────────────────────────>                   │
+                                  │                     │                           │                            │                                          │                   │
+                                  │                     │                           │                            │                                          │                   │
+                                  │                     │ <─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─                    │
+                                  │                     │                           │                            │                                          │                   │
+                                  │   Deployment ID     │                           │                            │                                          │                   │
+                                  │<─ ─ ─ ─ ─ ─ ─ ─ ─ ─ │                           │                            │                                          │                   │
+                                  │                     │                           │                            │                                          │                   │
+                                  │                   Start step                    │                            │                                          │                   │
+                                  │────────────────────────────────────────────────>│                            │                                          │                   │
+                                  │                     │                           │                            │                                          │                   │
+                                  │                     │                           │                            │     Create Pages deployment              │                   │
+                                  │                     │                           │ ──────────────────────────────────────────────────────────────────────────────────────────>
+                                  │                     │                           │                            │                                          │                   │
+                                  │                     │                           │                            │                                          │                   │
+                                  │                     │                           │ <─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+                                  │                     │                           │                            │                                          │                   │
+                                  │                     │                           │                            │                                          │                   │
+                                  │<─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ │                            │                                          │                   │
+                                  │                     │                           │                            │                                          │                   │
+                                  │                     │           Start step      │                            │                                          │                   │
+                                  │─────────────────────────────────────────────────────────────────────────────>│                                          │                   │
+                                  │                     │                           │                            │                                          │                   │
+                                  │                     │                           │                            │                                          │                   │
+          ╔═══════╤═══════════════╪═════════════════════╪═══════════════════════════╪════════════════════════════╪══════════════════════════════════════════╪═══════════════════╪═══════════════╗
+          ║ LOOP  │  up to 5 minutes                    │                           │                            │                                          │                   │               ║
+          ╟───────┘               │                     │                           │                            │                                          │                   │               ║
+          ║                       │                     │                           │                            │                   Find matching deployment                   │               ║
+          ║                       │                     │                           │                            │ ─────────────────────────────────────────────────────────────>               ║
+          ║                       │                     │                           │                            │                                          │                   │               ║
+          ║                       │                     │                           │                            │                       id, stage, status  │                   │               ║
+          ║                       │                     │                           │                            │ <─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─               ║
+          ║                       │                     │                           │                            │                                          │                   │               ║
+          ║                       │                     │                           │                            │                                          │                   │               ║
+          ║         ╔══════╤══════╪═════════════════════╪═══════════════════════════╪════════════════════════════╪══════════════════════════════════════════╪═════════════╗     │               ║
+          ║         ║ ALT  │  status == failure         │                           │                            │                                          │             ║     │               ║
+          ║         ╟──────┘      │                     │                           │                            │                                          │             ║     │               ║
+          ║         ║             │                     │                           │                            │ Create GitHub deployment status (failed) │             ║     │               ║
+          ║         ║             │                     │                           │                            │ ─────────────────────────────────────────>             ║     │               ║
+          ║         ║             │                     │                           │                            │                                          │             ║     │               ║
+          ║         ║             │                     │                           │                            │                                          │             ║     │               ║
+          ║         ║             │                     │                           │                            │ <─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─             ║     │               ║
+          ║         ║             │                     │                           │                            │                                          │             ║     │               ║
+          ║         ║             │                     │                           │                            │                                          │             ║     │               ║
+          ║         ║             │<─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                                          │             ║     │               ║
+          ║         ╚═════════════╪═════════════════════╪═══════════════════════════╪════════════════════════════╪══════════════════════════════════════════╪═════════════╝     │               ║
+          ║                       │                     │                           │                            │                                          │                   │               ║
+          ║                       │                     │                           │                            │                                          │                   │               ║
+          ║         ╔══════╤══════╪═════════════════════╪═══════════════════════════╪════════════════════════════╪══════════════════════════════════════════╪═════════════╗     │               ║
+          ║         ║ ALT  │  stage == deploy and status == success                 │                            │                                          │             ║     │               ║
+          ║         ╟──────┘      │                     │                           │                            │                                          │             ║     │               ║
+          ║         ║             │                     │                           │                            │ Create GitHub deployment status (success)│             ║     │               ║
+          ║         ║             │                     │                           │                            │ ─────────────────────────────────────────>             ║     │               ║
+          ║         ║             │                     │                           │                            │                                          │             ║     │               ║
+          ║         ║             │                     │                           │                            │                                          │             ║     │               ║
+          ║         ║             │                     │                           │                            │ <─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─             ║     │               ║
+          ║         ║             │                     │                           │                            │                                          │             ║     │               ║
+          ║         ║             │                     │    id, Cloudflare Pages url                            │                                          │             ║     │               ║
+          ║         ║             │<─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                                          │             ║     │               ║
+          ║         ╚═════════════╪═════════════════════╪═══════════════════════════╪════════════════════════════╪══════════════════════════════════════════╪═════════════╝     │               ║
+          ║                       │                     │                           │                            │                                          │                   │               ║
+          ║                       │                     │                           │                            │ Create GitHub deployment status (pending)│                   │               ║
+          ║                       │                     │                           │                            │ ─────────────────────────────────────────>                   │               ║
+          ║                       │                     │                           │                            │                                          │                   │               ║
+          ║                       │                     │                           │                            │                                          │                   │               ║
+          ║                       │                     │                           │                            │ <─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─                   │               ║
+          ╚═══════════════════════╪═════════════════════╪═══════════════════════════╪════════════════════════════╪══════════════════════════════════════════╪═══════════════════╪═══════════════╝
+                                  │                     │                           │                            │                                          │                   │
+                                  │                     │                           │                            │  Create GitHub deployment status (error) │                   │
+                                  │                     │                           │                            │ ─────────────────────────────────────────>                   │
+                                  │                     │                           │                            │                                          │                   │
+                                  │                     │                           │                            │                                          │                   │
+                                  │<─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                                          │                   │
+                              ┌───┴───┐          ┌──────┴───────┐          ┌────────┴─────────┐          ┌───────┴────────┐                              ┌──┴───┐          ┌────┴─────┐
+                              │GitHub │          │create-github-│          │create-cloudflare-│          │poll-deployment-│                              │GitHub│          │Cloudflare│
+                              │Actions│          │deployment    │          │pages-deployment  │          │status          │                              │API   │          │API       │
+                              └───────┘          └──────────────┘          └──────────────────┘          └────────────────┘                              └──────┘          └──────────┘
+#+end_src
+
+*** Create GitHub deployment
+
+Create Github deployment is responsible for calling the [[https://docs.github.com/en/rest/deployments/deployments#create-a-deployment][create deployments
+GitHub API]] and outputting the newly created deployment identifier.
+
+It is implemented in bash and a standalone example can be tested and viewed:
+[[file:create-gh-deployment.sh]]
+
+GitHub deployments are used purely for convenience purposes by populating GitHub
+deployment history and filling the environment section on the repository page.
+
+**** create-gh-deployment.sh
+***** Inputs
+
+#+name: create-gh-deployment-inputs
+| Environment variable    | Required | Description                                                          | Value                           | Resources                                  |
+|-------------------------+----------+----------------------------------------------------------------------+---------------------------------+--------------------------------------------|
+| INPUT_ENVIRONMENT       | Yes      | The deployment target environment, e.g test, dev, qa, production.    | =inputs.cloudflare-environment= | [[https://docs.github.com/en/rest/deployments/deployments#create-a-deployment][GitHub create deployment API]]               |
+| INPUT_GITHUB_REF        | Yes      | The ref for the deploy. This can be a branch, tag, or SHA.           | =github.ref=                    | Required by [[https://docs.github.com/en/rest/deployments/deployments#create-a-deployment][GitHub Create a deployment API]] |
+| INPUT_GITHUB_REPOSITORY | Yes      | The owner and repository name. For example, eddiegroves/hello-world. | =github.repository=             | [[https://docs.github.com/en/actions/learn-github-actions/contexts#github-context][GitHub Actions contexts]]                    |
+| GITHUB_TOKEN            | Yes      | A token to authenticate on behalf of the GitHub Action.              | =github.token=                  | [[https://docs.github.com/en/actions/learn-github-actions/contexts#github-context][GitHub Actions contexts]]                    |
+
+#+name: create-gh-deployment-inputs-list
+#+begin_src python :var inputs=create-gh-deployment-inputs[,0] :results raw :exports none
+return ' '.join(map(lambda input_name: f"\"{input_name}\"" ,inputs))
+#+end_src
+
+***** Outputs
+
+| GitHub outputs       | Description                              |
+|----------------------+------------------------------------------|
+| github-deployment-id | The created GitHub deployment identifier |
+
+***** Source
+:PROPERTIES:
+:header-args: :shebang "#!/bin/bash" :comments link :noweb yes
+:END:
+
+#+name: create-gh-deployment.sh
+#+begin_src sh :tangle create-gh-deployment.sh
+# * Inputs
+#
+# |-------------------------+----------------------------------------------------------------------|
+# | Environment variable    | Description                                                          |
+# |-------------------------+----------------------------------------------------------------------|
+# | INPUT_ENVIRONMENT       | The deployment target environment, e.g test, dev, qa, staging.       |
+# | INPUT_GITHUB_REF        | The ref for the deploy. This can be a branch, tag, or SHA.           |
+# | INPUT_GITHUB_REPOSITORY | The owner and repository name. For example, eddiegroves/hello-world. |
+# | GITHUB_TOKEN            | A token to authenticate on behalf of the GitHub Action.              |
+# |-------------------------+----------------------------------------------------------------------|
+#
+# * Outputs
+#
+# |----------------------+------------------------------------------|
+# | GitHub outputs       | Description                              |
+# |----------------------+------------------------------------------|
+# | github-deployment-id | The created GitHub deployment identifier |
+# |----------------------+------------------------------------------|
+
+errors=""
+declare -a inputs=(<<create-gh-deployment-inputs-list()>>)
+
+for input_name in "${inputs[@]}"
+do
+    if [ -z ${!input_name+x} ]; then
+       errors="${errors}environment variable $input_name is required\n"
+    fi
+done
+
+if [ ! -z "${errors}" ]; then
+    printf "$errors"
+    exit 1
+fi
+
+json_string=$( jq -n \
+                 --arg environment "$INPUT_ENVIRONMENT" \
+                 --arg github_ref "$INPUT_GITHUB_REF" \
+                 '<<create-gh-deployment-json-jq-single-line>>')
+
+curl --silent \
+  -X POST \
+  https://api.github.com/repos/$INPUT_GITHUB_REPOSITORY/deployments \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -d "$json_string" | jq '.id' | xargs -I {} echo "::set-output name=github-deployment-id::{}"
+#+end_src
+
+***** GitHub API request body :noexport:
+
+The API request to GitHub is constructed using =jq=:
+
+#+name: create-gh-deployment-json-jq
+#+begin_src jq :cmd-line -n --arg environment "production" --arg github_ref "main" :wrap src json
+{
+  auto_merge: false,
+  description: "Cloudflare Pages",
+  environment: $environment,
+  production_environment: (if $environment == "production" then true else false end),
+  ref: $github_ref,
+  required_contexts: []
+}
+#+end_src
+
+#+RESULTS: create-gh-deployment-json-jq
+#+begin_src json
+{
+  "auto_merge": false,
+  "description": "Cloudflare Pages",
+  "environment": "production",
+  "production_environment": true,
+  "ref": "main",
+  "required_contexts": []
+}
+#+end_src
+
+Get jq input into a single line:
+
+#+begin_src python :noweb yes :results raw :wrap src sh
+import re
+
+block = '''
+<<create-gh-deployment-json-jq>>
+        '''
+return re.sub(' + ', ' ', block.replace('\n', ''))
+#+end_src
+
+#+name: create-gh-deployment-json-jq-single-line
+#+RESULTS:
+#+begin_src sh
+{ auto_merge: false, description: "Cloudflare Pages", environment: $environment, production_environment: (if $environment == "production" then true else false end), ref: $github_ref, required_contexts: []}
+#+end_src
+
+*** Create Cloudflare Pages deployment
+
+Create Cloudflare Pages deployment deploys a directory of static assets as a
+Pages deployment.
+
+It is implemented in bash and a standalone example can be tested and viewed:
+
+The implementation uses Cloudflare Wrangler CLI tool which is an npm package.
+
+#+begin_src sh :colnames '("Name" "Homepage" "Description") :exports none
+npm info wrangler@2.0.29 --category name homepage description --json | gojq -r '[ .name, .homepage, .description ] | @csv'
+#+end_src
+
+#+RESULTS:
+| Name     | Homepage                                       | Description                                              |
+|----------+------------------------------------------------+----------------------------------------------------------|
+| wrangler | https://github.com/cloudflare/wrangler2#readme | Command-line interface for all things Cloudflare Workers |
+
+**** create-cf-deployment-status.sh
+***** Inputs
+
+#+name: create-cf-deployment-status-inputs
+| Environment variable          | Required | Description                                                                                           | Value                                  | Resources                                                                                                                              |
+|-------------------------------+----------+-------------------------------------------------------------------------------------------------------+----------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------|
+| CLOUDFLARE_ACCOUNT_ID         | Yes      | Used by Wranlger to identify the Cloudflare Pages account.                                            | =inputs.cloudflare-account-id=         | [[https://github.com/cloudflare/wrangler2/blob/wrangler%402.0.29/packages/wrangler/src/user/env-vars.ts#L43][Wrangler source]]                                                                                                                        |
+| CLOUDFLARE_API_TOKEN          | Yes      | Used by Wranlger to authenticate to Cloudflare API.                                                   | =inputs.cloudflare-api-token=          | [[https://github.com/cloudflare/wrangler2/blob/wrangler%402.0.29/packages/wrangler/src/user/env-vars.ts#L12][Wrangler source]]                                                                                                                        |
+| INPUT_CLOUDFLARE_PROJECT_NAME | Yes      | The name of the Cloudflare Pages project you want to deploy to.                                       | =inputs.cloudflare-pages-project-name= | [[https://developers.cloudflare.com/workers/wrangler/commands/#publish-1][Wrangler pages publish command]]                                                                                                         |
+| INPUT_ENVIRONMENT             | Yes      | The deployment target environment, e.g test, dev, qa, staging. Cloudflare refers to this as a branch. | =inputs.cloudflare-environment=        | [[https://developers.cloudflare.com/workers/wrangler/commands/#publish-1][Wrangler pages publish command]]                                                                                                         |
+| INPUT_PUBLISH_DIRECTORY       | Yes      | The directory of static files to upload.                                                              | =inputs.cloudflare-publish-directory=  | [[https://developers.cloudflare.com/workers/wrangler/commands/#publish-1][Wrangler pages publish command]]                                                                                                         |
+| INPUT_COMMIT_HASH             | Yes      | The SHA to attach to this deployment.                                                                 | =github.sha=                           | [[https://developers.cloudflare.com/workers/wrangler/commands/#publish-1][Wrangler pages publish command]]                                                                                                         |
+| INPUT_MESSAGE                 | Yes      | The commit message to attach to this deployment.                                                      | =github.event.head_commit.message=     | [[https://developers.cloudflare.com/workers/wrangler/commands/#publish-1][Wrangler pages publish command]] https://stackoverflow.com/a/63619526/19596450  [[https://docs.github.com/en/developers/webhooks-and-events/webhooks/webhook-events-and-payloads#push][github.event.head_commit object available for push event]] |
+
+#+name: create-cf-deployment-status-inputs-list
+#+begin_src python :var inputs=create-cf-deployment-status-inputs[,0] :results raw :exports none
+return ' '.join(map(lambda input_name: f"\"{input_name}\"" ,inputs))
+#+end_src
+
+***** Outputs
+
+No outputs are created.
+
+***** Source
+:PROPERTIES:
+:header-args: :shebang "#!/bin/bash" :comments link :noweb yes
+:END:
+
+#+name: create-cf-deployment-status.sh
+#+begin_src sh :tangle create-cf-deployment-status.sh
+# * Input
+#
+# |-------------------------------+-----------------------------------------------------------------|
+# | Environment variable          | Description                                                     |
+# |-------------------------------+-----------------------------------------------------------------|
+# | CLOUDFLARE_ACCOUNT_ID         | Used by Wranlger to identify the Cloudflare Pages account.      |
+# | CLOUDFLARE_API_TOKEN          | Used by Wranlger to authenticate to Cloudflare API.             |
+# | INPUT_CLOUDFLARE_PROJECT_NAME | The name of the Cloudflare Pages project you want to deploy to. |
+# | INPUT_ENVIRONMENT             | The deployment target environment, e.g test, dev, qa, staging.  |
+# | INPUT_PUBLISH_DIRECTORY       | The directory of static files to upload.                        |
+# | INPUT_COMMIT_HASH             | The SHA to attach to this deployment.                           |
+# | INPUT_MESSAGE                 | The commit message to attach to this deployment.                |
+# |-------------------------------+-----------------------------------------------------------------|
+#
+# * Output
+#
+# No outputs are created.
+
+errors=""
+declare -a inputs=(<<create-cf-deployment-status-inputs-list()>>)
+
+for input_name in "${inputs[@]}"
+do
+    if [ -z ${!input_name+x} ]; then
+       errors="${errors}environment variable $input_name is required\n"
+    fi
+done
+
+if [ ! -z "${errors}" ]; then
+    printf "$errors"
+    exit 1
+fi
+
+npx wrangler@2.0.29 pages publish $INPUT_PUBLISH_DIRECTORY \
+--project-name=$INPUT_CLOUDFLARE_PROJECT_NAME \
+--branch=$INPUT_ENVIRONMENT \
+--commit-hash=$INPUT_COMMIT_HASH \
+--commit-message="$INPUT_MESSAGE"
+#+end_src
+
+*** Poll deployment status
+**** poll-deployment-status.sh
+***** Inputs
+
+#+name: poll-deployment-status-inputs
+| Environment variable          | Required | Description                                                          | Value                                                     | Resources                      |
+|-------------------------------+----------+----------------------------------------------------------------------+-----------------------------------------------------------+--------------------------------|
+| INPUT_COMMIT_HASH             | Yes      | The SHA to attach to this deployment.                                | =github.sha=                                              |                                |
+| INPUT_GITHUB_DEPLOYMENT_ID    | Yes      | The GitHub deployment identifier for this deployment.                | =steps.create-gh-deployment.outputs.github-deployment-id= |                                |
+| INPUT_GITHUB_REPOSITORY       | Yes      | The owner and repository name. For example, eddiegroves/hello-world. | =github.repository=                                       | [[https://docs.github.com/en/actions/learn-github-actions/contexts#github-context][GitHub Actions contexts]]        |
+| INPUT_CLOUDFLARE_PROJECT_NAME | Yes      | The name of the Cloudflare Pages project you want to deploy to.      | =inputs.cloudflare-pages-project-name=                    | [[https://developers.cloudflare.com/workers/wrangler/commands/#publish-1][Wrangler pages publish command]] |
+| GITHUB_TOKEN                  | Yes      | A token to authenticate on behalf of the GitHub Action.              | =github.token=                                            | [[https://docs.github.com/en/actions/learn-github-actions/contexts#github-context][GitHub Actions contexts]]        |
+| CLOUDFLARE_ACCOUNT_ID         | Yes      | Used by Wrangler to identify the Cloudflare Pages account.           | =inputs.cloudflare-account-id=                            | [[https://github.com/cloudflare/wrangler2/blob/wrangler%402.0.29/packages/wrangler/src/user/env-vars.ts#L43][Wrangler source]]                |
+| CLOUDFLARE_API_TOKEN          | Yes      | Used by Wrangler to authenticate to Cloudflare API.                  | =inputs.cloudflare-api-token=                             | [[https://github.com/cloudflare/wrangler2/blob/wrangler%402.0.29/packages/wrangler/src/user/env-vars.ts#L12][Wrangler source]]                |
+
+***** Outputs
+
+| GitHub outputs                 | Description                                         |
+|--------------------------------+-----------------------------------------------------|
+| cloudflare-pages-deployment-id | The created Cloudflare Pages deployment identifier. |
+| cloudflare-pages-url           | The URL where Cloudflare Pages was deployed to.     |
+
+***** Source
+:PROPERTIES:
+:header-args: :comments link
+:END:
+
+#+name: poll-deployment-status.py
+#+begin_src python :tangle poll-deployment-status.py
+# * Inputs
+#
+# |-------------------------------+----------+----------------------------------------------------------------------|
+# | Environment variable          | Required | Description                                                          |
+# |-------------------------------+----------+----------------------------------------------------------------------|
+# | INPUT_COMMIT_HASH             | Yes      | The SHA to attach to this deployment.                                |
+# | INPUT_GITHUB_DEPLOYMENT_ID    | Yes      | The GitHub deployment identifier for this deployment.                |
+# | INPUT_GITHUB_REPOSITORY       | Yes      | The owner and repository name. For example, eddiegroves/hello-world. |
+# | INPUT_CLOUDFLARE_PROJECT_NAME | Yes      | The name of the Cloudflare Pages project you want to deploy to.      |
+# | GITHUB_TOKEN                  | Yes      | A token to authenticate on behalf of the GitHub Action.              |
+# | CLOUDFLARE_ACCOUNT_ID         | Yes      | Used by Wrangler to identify the Cloudflare Pages account.           |
+# | CLOUDFLARE_API_TOKEN          | Yes      | Used by Wrangler to authenticate to Cloudflare API.                  |
+# |-------------------------------+----------+----------------------------------------------------------------------|
+#
+# * Outputs
+# |--------------------------------+-----------------------------------------------------|
+# | GitHub outputs                 | Description                                         |
+# |--------------------------------+-----------------------------------------------------|
+# | cloudflare-pages-deployment-id | The created Cloudflare Pages deployment identifier. |
+# | cloudflare-pages-url           | The URL where Cloudflare Pages was deployed to.     |
+# |--------------------------------+-----------------------------------------------------|
+
+import http.client
+import json
+import subprocess
+import os
+from time import sleep
+from typing import Literal
+
+commit_hash = os.environ["INPUT_COMMIT_HASH"]
+github_deployment_id = os.environ["INPUT_GITHUB_DEPLOYMENT_ID"]
+github_repository = os.environ["INPUT_GITHUB_REPOSITORY"]
+cloudflare_project_name = os.environ["INPUT_CLOUDFLARE_PROJECT_NAME"]
+github_token = os.environ["GITHUB_TOKEN"]
+cloudflare_api_token = os.environ["CLOUDFLARE_API_TOKEN"]
+cloudflare_account_id = os.environ["CLOUDFLARE_ACCOUNT_ID"]
+
+
+def create_github_deployment_status(
+    description: str,
+    environment: str,
+    state: Literal[
+        "error", "failure", "inactive", "in_progress", "queued", "pending", "success"
+    ],
+    log_url: str = None,
+    environment_url: str = None,
+):
+    payload = {"description": description, "environment": environment, "state": state}
+
+    if log_url:
+        payload["log_url"] = log_url
+
+    if environment_url:
+        payload["environment_url"] = environment_url
+
+    headers = {
+        "User-Agent": "eddiegroves/action/cloudflare-deploy",
+        "Content-Type": "application/json",
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {github_token}",
+    }
+
+    githubApi = http.client.HTTPSConnection("api.github.com")
+    githubApi.request(
+        "POST",
+        f"/repos/{github_repository}/deployments/{github_deployment_id}/statuses",
+        json.dumps(payload),
+        headers,
+    )
+
+
+def list_cloudflare_deployments():
+    headers = {
+        "User-Agent": "eddiegroves/action/cloudflare-deploy",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {cloudflare_api_token}",
+    }
+
+    cloudflareApi = http.client.HTTPSConnection("api.cloudflare.com")
+    cloudflareApi.request(
+        "GET",
+        f"/client/v4/accounts/{cloudflare_account_id}/pages/projects/{cloudflare_project_name}/deployments",
+        "",
+        headers,
+    )
+
+    res = cloudflareApi.getresponse()
+    data = res.read().decode("utf-8")
+
+    p = subprocess.run(
+        [
+            "jq",
+            "-r",
+            "--arg",
+            "commit",
+            commit_hash,
+            ".result[] | select(.deployment_trigger.metadata.commit_hash == $commit) | { id, project_name, environment,  url: (.aliases[0] // .url), stage: .latest_stage.name, status: .latest_stage.status }",
+        ],
+        input=data,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    return json.loads(p.stdout)
+
+
+count = 0
+while count < 60:
+    deployment = list_cloudflare_deployments()
+
+    if deployment["status"] == "failed":
+        print("😢 sad face")
+        create_github_deployment_status(
+            description="Cloudflare Pages deployment failed.",
+            environment="production",
+            state="failure",
+            log_url=f"https://dash.cloudflare.com?to=/:account/pages/view/{cloudflare_project_name}/{deployment['id']}",
+        )
+        exit(1)
+
+    if deployment["stage"] == "deploy" and deployment["status"] == "success":
+        print("🤗 happy face")
+        create_github_deployment_status(
+            description="Cloudflare Pages deployment success.",
+            environment="production",
+            state="success",
+            log_url=f"https://dash.cloudflare.com?to=/:account/pages/view/{cloudflare_project_name}/{deployment['id']}",
+            environment_url=deployment["url"],
+        )
+
+        print(f"::set-output name=cloudflare-pages-deployment-id::{deployment['id']}")
+        print(f"::set-output name=cloudflare-pages-deployment-id::{deployment['url']}")
+        exit(0)
+
+    print(f"🧐 {deployment['stage']} {deployment['status']}")
+    create_github_deployment_status(
+        description="Cloudflare Pages deployment in progress.",
+        environment="production",
+        state="in_progress",
+        log_url=f"https://dash.cloudflare.com?to=/:account/pages/view/{cloudflare_project_name}/{deployment['id']}",
+    )
+    sleep(5)
+    count = count + 1
+
+print("😭 super sad")
+create_github_deployment_status(
+    description="Cloudflare Pages deployment status unknown.",
+    environment="production",
+    state="error",
+)
+exit(1)
+#+end_src
+
+** action.yml :noexport:
+
+#+begin_src yaml :noweb yes :tangle action.yml
+name: "Cloudflare Pages deploy"
+description: "Deploys files to Cloudflare Pages project and sets Github deployment status."
+inputs:
+  <<action-inputs-to-yaml()>>
+outputs:
+  github-deployment-id:
+    description: "The GitHub deployment identifier that this action created."
+    value: ${{ steps.create-gh-deployment.outputs.github-deployment-id }}
+  cloudflare-pages-deployment-id :
+    description: "The created Cloudflare Pages deployment identifier."
+    value: ${{ steps.poll-deployment-status.outputs.cloudflare-pages-deployment-id }}
+  cloudflare-pages-url:
+    description: "The URL where Cloudflare Pages was deployed to."
+    value: ${{ steps.poll-deployment-status.outputs.cloudflare-pages-url }}
+runs:
+  using: "composite"
+  steps:
+    - name: Create GitHub deployment
+      id: create-gh-deployment
+      shell: bash
+      env:
+        INPUT_GITHUB_REPOSITORY: ${{ github.repository }}
+        INPUT_ENVIRONMENT: ${{ inputs.cloudflare-environment }}
+        INPUT_GITHUB_REF: ${{ github.ref }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        <<create-gh-deployment.sh>>
+    - name: Create Cloudflare Pages deployment
+      id: create-cf-deployment-status
+      shell: bash
+      env:
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare-account-id }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare-api-token }}
+        INPUT_PUBLISH_DIRECTORY: ${{ inputs.cloudflare-publish-directory }}
+        INPUT_CLOUDFLARE_PROJECT_NAME: ${{ inputs.cloudflare-pages-project-name }}
+        INPUT_ENVIRONMENT: ${{ inputs.cloudflare-environment }}
+        INPUT_COMMIT_HASH: ${{ github.sha }}
+        INPUT_MESSAGE: ${{ github.event.head_commit.message }}
+      run: |
+        <<create-cf-deployment-status.sh>>
+    - name: Poll deployment status
+      id: poll-deployment-status
+      shell: python
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare-account-id }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare-api-token }}
+        INPUT_COMMIT_HASH: ${{ github.sha }}
+        INPUT_GITHUB_DEPLOYMENT_ID: ${{ steps.create-gh-deployment.outputs.github-deployment-id }}
+        INPUT_GITHUB_REPOSITORY: ${{ github.repository }}
+        INPUT_CLOUDFLARE_PROJECT_NAME: ${{ inputs.cloudflare-pages-project-name }}
+      run: |
+        <<poll-deployment-status.py>>
+#+end_src
