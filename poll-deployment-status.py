@@ -131,7 +131,7 @@ while count < 60:
         )
 
         print(f"::set-output name=cloudflare-pages-deployment-id::{deployment['id']}")
-        print(f"::set-output name=cloudflare-pages-deployment-id::{deployment['url']}")
+        print(f"::set-output name=cloudflare-pages-url::{deployment['url']}")
         exit(0)
 
     print(f"🧐 {deployment['stage']} {deployment['status']}")
